@@ -42,7 +42,9 @@ import { DeleteEdgeDialog } from "./DeleteEdgeDialog";
 import { EditNodeDialog } from "./EditNodeDialog";
 import { EditEdgeDialog } from "./EditEdgeDialog";
 import { DiagramLegend } from "./DiagramLegend";
-import { useUserEdits } from "@/hooks/useUserEdits";
+import { SpotlightChatBar } from "./SpotlightChatBar";
+import { useUserEdits, SyncStatus } from "@/hooks/useUserEdits";
+import { useAuth } from "@/contexts/AuthContext";
 import {
   ZoomLevel,
   GraphNode as GraphNodeType,
@@ -275,8 +277,13 @@ function GraphViewInner() {
   const [editNodeTarget, setEditNodeTarget] = useState<GraphNodeType | null>(null);
   const [editEdgeTarget, setEditEdgeTarget] = useState<{ edge: GraphEdgeType; sourceLabel: string; targetLabel: string } | null>(null);
 
-  // User edits persistence
-  const userEdits = useUserEdits(repoId);
+  // Floating chat bar state
+  const [floatingChatMode, setFloatingChatMode] = useState<"hidden" | "bar" | "expanded">("hidden");
+  const [panelActiveTab, setPanelActiveTab] = useState("overview");
+
+  // Auth + user edits persistence
+  const { user, signOut } = useAuth();
+  const userEdits = useUserEdits(repoId, user?.id);
 
   // Load generated repo data on mount
   useEffect(() => {
@@ -542,6 +549,8 @@ function GraphViewInner() {
       const graphNode = graphNodes.find((n) => n.id === node.id);
       if (!graphNode) return;
       setSelectedNode(graphNode);
+      setFloatingChatMode("bar");
+      setPanelActiveTab("overview");
     },
     [graphNodes]
   );
@@ -571,11 +580,13 @@ function GraphViewInner() {
   const handlePaneClick = useCallback(() => {
     setSelectedNode(null);
     setContextMenu(null);
+    setFloatingChatMode("hidden");
   }, []);
 
   const handleZoomChange = useCallback((level: ZoomLevel) => {
     setZoomLevel(level);
     setSelectedNode(null);
+    setFloatingChatMode("hidden");
     if (level !== "file") setFileModuleId(null);
     setTimeout(() => {
       reactFlowInstance.fitView({ padding: 0.2, duration: 500 });
@@ -628,9 +639,10 @@ function GraphViewInner() {
     [navigate]
   );
 
-  const handleSignOut = useCallback(() => {
+  const handleSignOut = useCallback(async () => {
+    await signOut();
     navigate("/");
-  }, [navigate]);
+  }, [navigate, signOut]);
 
   // Handle navigation to file or directory from Code tab — drill into the parent module
   const handleNavigateToFile = useCallback(
@@ -946,22 +958,47 @@ function GraphViewInner() {
             </DropdownMenuContent>
           </DropdownMenu>
 
-          {/* User menu */}
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button variant="ghost" size="icon">
-                <Avatar className="w-8 h-8">
-                  <AvatarFallback>U</AvatarFallback>
-                </Avatar>
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuItem onClick={handleSignOut}>
-                <LogOut className="w-4 h-4 mr-2" />
-                Sign out
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          {/* Sync indicator + User menu */}
+          <div className="flex items-center gap-1">
+            {userEdits.syncStatus !== "offline" && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <div className={`w-2 h-2 rounded-full ${
+                    userEdits.syncStatus === "synced" ? "bg-green-500" :
+                    userEdits.syncStatus === "syncing" ? "bg-yellow-500 animate-pulse" :
+                    "bg-red-500"
+                  }`} />
+                </TooltipTrigger>
+                <TooltipContent>
+                  {userEdits.syncStatus === "synced" ? "All changes saved" :
+                   userEdits.syncStatus === "syncing" ? "Saving..." :
+                   "Sync error — changes saved locally"}
+                </TooltipContent>
+              </Tooltip>
+            )}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="icon">
+                  <Avatar className="w-8 h-8">
+                    <AvatarFallback>
+                      {user?.email ? user.email.substring(0, 2).toUpperCase() : "U"}
+                    </AvatarFallback>
+                  </Avatar>
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                {user?.email && (
+                  <DropdownMenuItem disabled className="text-xs text-muted-foreground">
+                    {user.email}
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuItem onClick={handleSignOut}>
+                  <LogOut className="w-4 h-4 mr-2" />
+                  Sign out
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
         </div>
       </header>
 
@@ -984,7 +1021,7 @@ function GraphViewInner() {
 
         {/* Graph canvas */}
         <motion.div
-          className="flex-1 relative"
+          className="flex-1 relative overflow-hidden"
           animate={{ width: selectedNode ? "calc(100% - 400px)" : "100%" }}
           transition={{ duration: 0.3, ease: [0.25, 0.46, 0.45, 0.94] }}
         >
@@ -1021,6 +1058,27 @@ function GraphViewInner() {
             />
           </ReactFlow>
           <DiagramLegend />
+
+          {/* Floating spotlight chat bar */}
+          <AnimatePresence>
+            {selectedNode && floatingChatMode !== "hidden" && (
+              <SpotlightChatBar
+                node={selectedNode}
+                allNodes={graphNodes}
+                allEdges={graphEdges}
+                systemGroups={repoSystemGroups}
+                repo={repo}
+                zoomLevel={zoomLevel}
+                mode={floatingChatMode as "bar" | "expanded"}
+                onExpand={() => setFloatingChatMode("expanded")}
+                onMoveToPanel={() => {
+                  setFloatingChatMode("hidden");
+                  setPanelActiveTab("chat");
+                }}
+                onClose={() => setFloatingChatMode("hidden")}
+              />
+            )}
+          </AnimatePresence>
         </motion.div>
 
         {/* Detail panel */}
@@ -1028,7 +1086,10 @@ function GraphViewInner() {
           {selectedNode && (
             <DetailPanel
               node={selectedNode}
-              onClose={() => setSelectedNode(null)}
+              onClose={() => {
+                setSelectedNode(null);
+                setFloatingChatMode("hidden");
+              }}
               onNavigateToNode={handleNavigateToNode}
               onNavigateToFile={handleNavigateToFile}
               onEditNode={handleEditNode}
@@ -1036,6 +1097,16 @@ function GraphViewInner() {
               getFieldEdits={userEdits.getFieldEdits}
               getNodeNote={userEdits.getNodeNote}
               setNodeNote={userEdits.setNodeNote}
+              allNodes={graphNodes}
+              allEdges={graphEdges}
+              systemGroups={repoSystemGroups}
+              repo={repo}
+              zoomLevel={zoomLevel}
+              activeTab={panelActiveTab}
+              onActiveTabChange={(tab) => {
+                setPanelActiveTab(tab);
+                if (tab === "chat") setFloatingChatMode("hidden");
+              }}
             />
           )}
         </AnimatePresence>

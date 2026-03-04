@@ -34,6 +34,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   GraphNode,
+  GraphEdge,
   NodeType,
   WorkflowStep,
   EdgeCase,
@@ -41,8 +42,11 @@ import {
   DataFlow,
   LogicLocation,
   ImplementationFile,
-  TechnicalDecision
+  TechnicalDecision,
+  SystemGroupDef,
+  Repository,
 } from "@/data/demoData";
+import { ChatTab } from "./ChatTab";
 import { NodeFieldEdits } from "@/hooks/useUserEdits";
 import { EditableText } from "./EditableText";
 import { EditableList } from "./EditableList";
@@ -59,6 +63,13 @@ interface DetailPanelProps {
   getFieldEdits?: (nodeId: string) => NodeFieldEdits;
   getNodeNote?: (nodeId: string) => string;
   setNodeNote?: (nodeId: string, note: string) => void;
+  allNodes?: GraphNode[];
+  allEdges?: GraphEdge[];
+  systemGroups?: SystemGroupDef[];
+  repo?: Repository;
+  zoomLevel?: string;
+  activeTab?: string;
+  onActiveTabChange?: (tab: string) => void;
 }
 
 const nodeTypeConfig: Record<NodeType, {
@@ -116,8 +127,13 @@ function hasEnhancedData(node: GraphNode): boolean {
             node.technicalSpecs || (node.codeFiles && node.codeFiles.length > 0));
 }
 
-export function DetailPanel({ node, onClose, onNavigateToNode, onNavigateToFile, onEditNode, onEditField, getFieldEdits, getNodeNote, setNodeNote }: DetailPanelProps) {
-  const [activeTab, setActiveTab] = useState("overview");
+export function DetailPanel({ node, onClose, onNavigateToNode, onNavigateToFile, onEditNode, onEditField, getFieldEdits, getNodeNote, setNodeNote, allNodes, allEdges, systemGroups, repo, zoomLevel, activeTab: controlledTab, onActiveTabChange }: DetailPanelProps) {
+  const [localTab, setLocalTab] = useState("overview");
+  const activeTab = controlledTab ?? localTab;
+  const setActiveTab = (tab: string) => {
+    setLocalTab(tab);
+    onActiveTabChange?.(tab);
+  };
 
   if (!node) return null;
 
@@ -196,12 +212,13 @@ export function DetailPanel({ node, onClose, onNavigateToNode, onNavigateToFile,
         {enhanced ? (
           <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1 flex flex-col min-h-0">
             <div className="px-5 pt-4">
-              <TabsList className="w-full grid grid-cols-5 h-9">
+              <TabsList className="w-full grid grid-cols-6 h-9">
                 <TabsTrigger value="overview" className="text-xs px-2">Overview</TabsTrigger>
                 <TabsTrigger value="architecture" className="text-xs px-2">Arch</TabsTrigger>
                 <TabsTrigger value="code" className="text-xs px-2">Code</TabsTrigger>
                 <TabsTrigger value="decisions" className="text-xs px-2">Decisions</TabsTrigger>
                 <TabsTrigger value="connections" className="text-xs px-2">Links</TabsTrigger>
+                <TabsTrigger value="chat" className="text-xs px-2">Chat</TabsTrigger>
               </TabsList>
             </div>
 
@@ -226,6 +243,24 @@ export function DetailPanel({ node, onClose, onNavigateToNode, onNavigateToFile,
                 <ConnectionsTab node={node} onNavigateToNode={onNavigateToNode} />
               </TabsContent>
             </ScrollArea>
+
+            {/* Chat tab lives outside ScrollArea — it manages its own scroll */}
+            <TabsContent value="chat" className="mt-0 flex-1 flex flex-col overflow-hidden" style={{ display: activeTab === 'chat' ? 'flex' : 'none' }}>
+              {allNodes && allEdges && systemGroups && repo ? (
+                <ChatTab
+                  node={node}
+                  allNodes={allNodes}
+                  allEdges={allEdges}
+                  systemGroups={systemGroups}
+                  repo={repo}
+                  zoomLevel={zoomLevel || node.level}
+                />
+              ) : (
+                <div className="p-5 text-sm text-muted-foreground text-center">
+                  Chat is not available for this view.
+                </div>
+              )}
+            </TabsContent>
           </Tabs>
         ) : (
           <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1 flex flex-col min-h-0">

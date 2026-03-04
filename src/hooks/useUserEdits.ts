@@ -1,8 +1,9 @@
 // Doc: Persistence layer for user-added/deleted nodes and edges
-// Stores edits in localStorage keyed by repoId
+// Stores edits in localStorage (always) + Supabase (when authenticated)
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GraphNode, GraphEdge, ZoomLevel } from "@/data/types";
+import { supabase } from "@/lib/supabase";
 
 /** All editable fields for a node — structural + content */
 export interface NodeFieldEdits {
@@ -20,7 +21,7 @@ export interface NodeFieldEdits {
   note?: string;
 }
 
-interface UserEdits {
+export interface UserEdits {
   addedNodes: GraphNode[];
   deletedNodeIds: string[];
   addedEdges: GraphEdge[];
@@ -35,36 +36,172 @@ interface UserEdits {
   nodeNotes: Record<string, string>;
 }
 
+export type SyncStatus = "synced" | "syncing" | "error" | "offline";
+
 const STORAGE_PREFIX = "legend-user-edits-";
 
 function getStorageKey(repoId: string) {
   return `${STORAGE_PREFIX}${repoId}`;
 }
 
-function loadEdits(repoId: string): UserEdits {
+function emptyEdits(): UserEdits {
+  return { addedNodes: [], deletedNodeIds: [], addedEdges: [], deletedEdgeIds: [], nodePositions: {}, editedNodes: {}, editedEdges: {}, nodeNotes: {} };
+}
+
+function loadEditsLocal(repoId: string): UserEdits {
   try {
     const raw = localStorage.getItem(getStorageKey(repoId));
     if (raw) return JSON.parse(raw);
   } catch {
     // Corrupted data — start fresh
   }
-  return { addedNodes: [], deletedNodeIds: [], addedEdges: [], deletedEdgeIds: [], nodePositions: {}, editedNodes: {}, editedEdges: {}, nodeNotes: {} };
+  return emptyEdits();
 }
 
-function saveEdits(repoId: string, edits: UserEdits) {
+function saveEditsLocal(repoId: string, edits: UserEdits) {
   localStorage.setItem(getStorageKey(repoId), JSON.stringify(edits));
 }
 
-export function useUserEdits(repoId: string | undefined) {
+function hasEdits(edits: UserEdits): boolean {
+  return (
+    edits.addedNodes.length > 0 ||
+    edits.deletedNodeIds.length > 0 ||
+    edits.addedEdges.length > 0 ||
+    edits.deletedEdgeIds.length > 0 ||
+    Object.keys(edits.nodePositions).length > 0 ||
+    Object.keys(edits.editedNodes).length > 0 ||
+    Object.keys(edits.editedEdges).length > 0 ||
+    Object.keys(edits.nodeNotes).length > 0
+  );
+}
+
+const DEBOUNCE_MS = 2000;
+
+export function useUserEdits(repoId: string | undefined, userId?: string) {
   const effectiveId = repoId || "__default__";
-  const [edits, setEdits] = useState<UserEdits>(() => loadEdits(effectiveId));
+  const [edits, setEdits] = useState<UserEdits>(() => loadEditsLocal(effectiveId));
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>(userId ? "syncing" : "offline");
+
+  // Refs for debounced save
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingEditsRef = useRef<UserEdits | null>(null);
+  const latestEditsRef = useRef(edits);
+  latestEditsRef.current = edits;
+
+  // Server save function
+  const saveToServer = useCallback(async (editsToSave: UserEdits) => {
+    if (!userId || !supabase) return;
+    setSyncStatus("syncing");
+    try {
+      const { error } = await supabase
+        .from('user_edits')
+        .upsert(
+          { user_id: userId, repo_id: effectiveId, edits: editsToSave, updated_at: new Date().toISOString() },
+          { onConflict: 'user_id,repo_id' }
+        );
+      if (error) throw error;
+      setSyncStatus("synced");
+      pendingEditsRef.current = null;
+    } catch (err) {
+      console.error('Failed to sync edits to server:', err);
+      setSyncStatus("error");
+    }
+  }, [userId, effectiveId]);
+
+  // Debounced server save
+  const debouncedServerSave = useCallback((next: UserEdits) => {
+    pendingEditsRef.current = next;
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    debounceTimerRef.current = setTimeout(() => {
+      if (pendingEditsRef.current) {
+        saveToServer(pendingEditsRef.current);
+      }
+    }, DEBOUNCE_MS);
+  }, [saveToServer]);
+
+  // Initial load: server-first with localStorage migration
+  useEffect(() => {
+    if (!userId || !supabase) {
+      setSyncStatus("offline");
+      return;
+    }
+
+    let cancelled = false;
+    setSyncStatus("syncing");
+
+    async function load() {
+      const { data, error } = await supabase!
+        .from('user_edits')
+        .select('edits')
+        .eq('user_id', userId!)
+        .eq('repo_id', effectiveId)
+        .single();
+
+      if (cancelled) return;
+
+      if (data?.edits && !error) {
+        // Server has data — use as truth
+        const serverEdits = data.edits as UserEdits;
+        setEdits(serverEdits);
+        saveEditsLocal(effectiveId, serverEdits);
+        setSyncStatus("synced");
+      } else {
+        // Server empty — migrate localStorage data if it exists
+        const local = loadEditsLocal(effectiveId);
+        if (hasEdits(local)) {
+          try {
+            await supabase!.from('user_edits').upsert(
+              { user_id: userId!, repo_id: effectiveId, edits: local, updated_at: new Date().toISOString() },
+              { onConflict: 'user_id,repo_id' }
+            );
+          } catch (err) {
+            console.error('Failed to migrate local edits:', err);
+          }
+        }
+        setSyncStatus("synced");
+      }
+    }
+
+    load();
+    return () => { cancelled = true; };
+  }, [userId, effectiveId]);
+
+  // Flush pending edits on visibility change (tab close / hide)
+  useEffect(() => {
+    if (!userId || !supabase) return;
+
+    const handler = () => {
+      if (document.visibilityState === 'hidden' && pendingEditsRef.current) {
+        // Attempt to flush via sendBeacon for reliability
+        const payload = JSON.stringify({
+          user_id: userId,
+          repo_id: effectiveId,
+          edits: pendingEditsRef.current,
+          updated_at: new Date().toISOString(),
+        });
+        // sendBeacon won't work with Supabase REST directly, so fire-and-forget a sync
+        saveToServer(pendingEditsRef.current);
+      }
+    };
+
+    window.addEventListener('visibilitychange', handler);
+    return () => window.removeEventListener('visibilitychange', handler);
+  }, [userId, effectiveId, saveToServer]);
+
+  // Cleanup debounce timer
+  useEffect(() => {
+    return () => {
+      if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    };
+  }, []);
 
   const persist = useCallback(
     (next: UserEdits) => {
       setEdits(next);
-      saveEdits(effectiveId, next);
+      saveEditsLocal(effectiveId, next); // Immediate local write
+      if (userId) debouncedServerSave(next); // Background server sync
     },
-    [effectiveId]
+    [effectiveId, userId, debouncedServerSave]
   );
 
   /** Merge user edits into pipeline nodes, filtered by zoom level */
@@ -127,23 +264,13 @@ export function useUserEdits(repoId: string | undefined) {
   /** Delete a node + cascade-delete connected edges */
   const deleteNode = useCallback(
     (nodeId: string) => {
-      // Find edges connected to this node (both pipeline and user-added)
-      const connectedUserEdgeIds = edits.addedEdges
-        .filter((e) => e.source === nodeId || e.target === nodeId)
-        .map((e) => e.id);
-
       const next: UserEdits = {
         ...edits,
         deletedNodeIds: [...edits.deletedNodeIds, nodeId],
-        // Remove user-added edges connected to this node
         addedEdges: edits.addedEdges.filter(
           (e) => e.source !== nodeId && e.target !== nodeId
         ),
-        // Also mark pipeline edges connected to this node as deleted
-        // (caller should pass those IDs, but we store the node deletion;
-        //  mergeEdges will handle filtering since endpoints won't exist)
         deletedEdgeIds: [...edits.deletedEdgeIds],
-        // Remove user-added nodes if it's a user node
         addedNodes: edits.addedNodes.filter((n) => n.id !== nodeId),
         nodePositions: { ...edits.nodePositions },
       };
@@ -168,7 +295,6 @@ export function useUserEdits(repoId: string | undefined) {
   /** Delete an edge */
   const deleteEdge = useCallback(
     (edgeId: string) => {
-      // Check if it's a user-added edge
       const isUserEdge = edits.addedEdges.some((e) => e.id === edgeId);
       const next: UserEdits = {
         ...edits,
@@ -360,5 +486,6 @@ export function useUserEdits(repoId: string | undefined) {
     exportEdits,
     importEdits,
     edits,
+    syncStatus,
   };
 }
