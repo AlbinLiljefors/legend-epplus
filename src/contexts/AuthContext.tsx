@@ -1,54 +1,74 @@
-import { createContext, useContext, useEffect, useState, useCallback, type ReactNode } from 'react';
-import { supabase } from '@/lib/supabase';
-import type { User } from '@supabase/supabase-js';
+import { createContext, useContext, useState, useCallback, type ReactNode } from 'react';
+
+const EMAIL_KEY = "legend-user-email";
+const NAME_KEY = "legend-user-name";
+
+declare global {
+  interface Window {
+    posthog?: {
+      identify: (id: string, properties?: Record<string, unknown>) => void;
+      reset: () => void;
+    };
+  }
+}
+
+/** Minimal user shape that satisfies useAuth() consumers (GraphView, RepoSelection, etc.) */
+interface LocalUser {
+  id: string;
+  email: string;
+  name: string;
+}
 
 interface AuthContextValue {
-  user: User | null;
+  user: LocalUser | null;
   loading: boolean;
-  signIn: (email: string) => Promise<{ error: string | null }>;
+  signIn: (name: string, email?: string) => Promise<{ error: string | null }>;
   signOut: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
+function getStoredUser(): LocalUser | null {
+  const email = localStorage.getItem(EMAIL_KEY);
+  const name = localStorage.getItem(NAME_KEY);
+  if (name) {
+    const resolvedEmail = email || `${name.replace(/\s+/g, ".")}@anonymous`;
+    return { id: resolvedEmail, email: resolvedEmail, name };
+  }
+  return null;
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    if (!supabase) {
-      setLoading(false);
-      return;
+  const [user, setUser] = useState<LocalUser | null>(() => {
+    const stored = getStoredUser();
+    if (stored) {
+      window.posthog?.identify(stored.email, { email: stored.email, name: stored.name });
     }
+    return stored;
+  });
 
-    // Get initial session
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setUser(session?.user ?? null);
-      setLoading(false);
-    });
+  const signIn = useCallback(async (name: string, email?: string) => {
+    const trimmedName = name.trim();
+    if (!trimmedName) return { error: 'Name is required' };
+    const resolvedEmail = email?.trim().toLowerCase() || `${trimmedName.replace(/\s+/g, ".")}@anonymous`;
 
-    // Listen for auth changes
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null);
-    });
+    localStorage.setItem(EMAIL_KEY, resolvedEmail);
+    localStorage.setItem(NAME_KEY, trimmedName);
+    window.posthog?.identify(resolvedEmail, { email: resolvedEmail, name: trimmedName });
 
-    return () => subscription.unsubscribe();
-  }, []);
-
-  const signIn = useCallback(async (email: string) => {
-    if (!supabase) return { error: 'Supabase not configured' };
-    const { error } = await supabase.auth.signInWithOtp({ email });
-    return { error: error?.message ?? null };
+    setUser({ id: resolvedEmail, email: resolvedEmail, name: trimmedName });
+    return { error: null };
   }, []);
 
   const signOut = useCallback(async () => {
-    if (!supabase) return;
-    await supabase.auth.signOut();
+    localStorage.removeItem(EMAIL_KEY);
+    localStorage.removeItem(NAME_KEY);
+    window.posthog?.reset();
     setUser(null);
   }, []);
 
   return (
-    <AuthContext.Provider value={{ user, loading, signIn, signOut }}>
+    <AuthContext.Provider value={{ user, loading: false, signIn, signOut }}>
       {children}
     </AuthContext.Provider>
   );
